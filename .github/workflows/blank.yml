@@ -1,0 +1,140 @@
+name: 小米Note11TPro专用安卓12-5.10内核构建
+
+env:
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android12'
+  KERNEL_VERSION: '5.10'
+  KERNEL_NAME: 'note11tpro-android12-5.10-gki'
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'KernelSU分支（如有，需要指定）'
+        required: false
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'sukisu'
+          - 'ksunext'
+      hook_method:
+        description: 'hook模式（仅在集成KernelSU时才需要配置）'
+        required: false
+        type: choice
+        default: 'manual'
+        options:
+          - 'manual'
+          - 'kprobes'
+          - 'syscall'
+      lz4_enable:
+        description: '是否安装 lz4/zstd 补丁'
+        required: false
+        type: choice
+        default: '0'
+        options:
+          - '0'
+          - '1'
+      bbr_enable:
+        description: '是否启用BBR算法，tcp网络优化'
+        required: false
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+          - 'default'
+      better_net:
+        description: '是否开启网络功能扩展'
+        required: false
+        type: choice
+        default: 'false'
+        options:
+          - 'true'
+          - 'false'
+      adios_enable:
+        description: '是否启用ADIOS IO调度器'
+        required: false
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+      kernel_suffix:
+        description: '内核后缀（选填，留空默认）'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: 安装依赖与初始化源码、工具链
+      run: |
+        sudo apt update
+        sudo apt-get install -y --no-install-recommends git python-is-python3 libssl-dev libelf-dev ccache
+
+        rm -rf kernel_workspace
+        mkdir kernel_workspace
+        cd kernel_workspace
+
+        echo "下载小米Note11TPro安卓12内核源码..."
+        # 你应该替换为自己已适配的源码仓库链接及主分支（如generic_5.10）
+        git clone --depth=1 https://github.com/xiaomi/mtk_kernel_xiaomi_sm8250.git -b android12-5.10 common
+
+        echo "下载AOSP Clang 14工具链..."
+        wget https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz
+        tar xf clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz
+        mv clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04 clang14
+
+        echo "源码和工具链初始化完成！"
+        cd common
+        # 可选：去除 ABI/dirt 后缀等与版本无关的标记
+        [ -f scripts/setlocalversion ] && sed -i 's/ -dirty//g' scripts/setlocalversion || true
+
+    - name: 配置CCACHE
+      run: |
+        echo "CCACHE_DIR=$HOME/.ccache_note11tpro" >> $GITHUB_ENV
+        ccache -M 3G
+
+    - name: 添加功能配置项到defconfig
+      run: |
+        cd kernel_workspace/common
+        echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> arch/arm64/configs/gki_defconfig
+        echo "CONFIG_LOCALVERSION_AUTO=n" >> arch/arm64/configs/gki_defconfig
+        if [[ "${{ github.event.inputs.lz4_enable }}" == '1' ]]; then
+          echo "CONFIG_CRYPTO_LZ4=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_CRYPTO_ZSTD=y" >> arch/arm64/configs/gki_defconfig
+        fi
+        if [[ "${{ github.event.inputs.bbr_enable }}" == 'true' || "${{ github.event.inputs.bbr_enable }}" == 'default' ]]; then
+          echo "CONFIG_TCP_CONG_BBR=y" >> arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.bbr_enable }}" == 'default' ]]; then
+            echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> arch/arm64/configs/gki_defconfig
+          fi
+        fi
+        if [[ "${{ github.event.inputs.better_net }}" == 'true' ]]; then
+          echo "CONFIG_IP_SET=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_SET=y" >> arch/arm64/configs/gki_defconfig
+        fi
+        if [[ "${{ github.event.inputs.adios_enable }}" == 'true' ]]; then
+          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> arch/arm64/configs/gki_defconfig
+        fi
+        if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+          sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.kernel_suffix }}\"|" scripts/setlocalversion
+        else
+          sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" scripts/setlocalversion
+        fi
+
+    # KernelSU/SUSFS步骤请按你项目仓库是否支持灵活增删
+    # 如需集成KernelSU，可补充与5.10+A12兼容的patch流程，否则可省略下方步骤
+
+    - name: 编译内核
+      run: |
+        cd kernel_workspace/common
+        export PATH="$PWD/../clang14/bin:$PATH"
+        export ARCH=arm64
+        export CC=clang
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        make O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
+        make -j$(nproc) O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu-
